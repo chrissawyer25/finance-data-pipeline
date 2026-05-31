@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 
 # --- Config ---
-HEADERS = {"User-Agent": "chris@email.com"}  # EDGAR requires a user-agent header
+HEADERS = {"User-Agent": "chris@email.com"}  # Replace with your real email
 
 COMPANIES = {
     "Apple":     "0000320193",
@@ -12,66 +12,89 @@ COMPANIES = {
     "Meta":      "0001326801"
 }
 
-# --- Helper: pull a specific financial metric from EDGAR ---
-def get_metric(cik, metric):
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    response = requests.get(url, headers=HEADERS)
+# Try these in order — first one with 10-K data wins
+REVENUE_LABELS = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+    "SalesRevenueGoodsNet",
+]
 
-    if response.status_code != 200:
-        print(f"Failed to fetch data for CIK {cik}")
-        return pd.DataFrame()
-
-    data = response.json()
-
+# --- Helper: pull a specific metric from already-fetched company data ---
+def get_metric(cik, metric, company_data):
     try:
-        # Most metrics live under us-gaap
-        facts = data["facts"]["us-gaap"][metric]["units"]["USD"]
+        facts = company_data["facts"]["us-gaap"][metric]["units"]["USD"]
         df = pd.DataFrame(facts)
 
-        # Keep only annual 10-K filings
+        # Only annual 10-K filings
         df = df[df["form"] == "10-K"]
+        if df.empty:
+            return pd.DataFrame()
 
-        # Keep relevant columns
-        df = df[["end", "val", "accn", "form"]].copy()
+        df = df[["end", "val"]].copy()
         df.rename(columns={"end": "date", "val": "value"}, inplace=True)
-
-        # Drop duplicates keeping most recent filing per year
         df["year"] = pd.to_datetime(df["date"]).dt.year
         df = df.sort_values("date").drop_duplicates(subset="year", keep="last")
-
-        # Keep last 5 years
         df = df[df["year"] >= df["year"].max() - 4]
         df = df[["year", "date", "value"]].reset_index(drop=True)
-        df["metric"] = metric
-
         return df
 
     except KeyError:
-        print(f"Metric '{metric}' not found for CIK {cik}")
         return pd.DataFrame()
 
 
-# --- Main: pull metrics for all companies ---
+# --- Helper: try all revenue labels, return first with data ---
+def get_revenue(cik, company_data):
+    for label in REVENUE_LABELS:
+        df = get_metric(cik, label, company_data)
+        if not df.empty:
+            print(f"  Revenue: using '{label}'")
+            df["metric"] = "revenue"
+            return df
+    print(f"  Revenue: no data found for CIK {cik}")
+    return pd.DataFrame()
+
+
+# --- Main ---
 def extract_all():
-    metrics = [
-        "Revenues",               # Revenue / Net Sales
-        "GrossProfit",            # Gross Profit
-        "OperatingIncomeLoss",    # Operating Income
-        "NetIncomeLoss",          # Net Income
-        "Assets",                 # Total Assets
-        "LiabilitiesAndStockholdersEquity"  # Total Liabilities + Equity
-    ]
+    OTHER_METRICS = {
+        "GrossProfit":                      "gross_profit",
+        "OperatingIncomeLoss":              "operating_income",
+        "NetIncomeLoss":                    "net_income",
+        "Assets":                           "total_assets",
+        "LiabilitiesAndStockholdersEquity": "total_liabilities_equity"
+    }
 
     all_data = []
 
     for company, cik in COMPANIES.items():
-        print(f"Pulling data for {company}...")
-        for metric in metrics:
-            df = get_metric(cik, metric)
+        print(f"\nPulling data for {company}...")
+
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        response = requests.get(url, headers=HEADERS)
+        if response.status_code != 200:
+            print(f"  Failed to fetch {company}")
+            continue
+        company_data = response.json()
+
+        # Revenue
+        df = get_revenue(cik, company_data)
+        if not df.empty:
+            df["company"] = company
+            df["cik"] = cik
+            all_data.append(df)
+
+        # All other metrics
+        for edgar_label, clean_name in OTHER_METRICS.items():
+            df = get_metric(cik, edgar_label, company_data)
             if not df.empty:
+                df["metric"] = clean_name
                 df["company"] = company
                 df["cik"] = cik
+                print(f"  {clean_name}: OK")
                 all_data.append(df)
+            else:
+                print(f"  {clean_name}: not found")
 
     if all_data:
         combined = pd.concat(all_data, ignore_index=True)
@@ -86,4 +109,5 @@ def extract_all():
 
 if __name__ == "__main__":
     df = extract_all()
+    print("\nSample output:")
     print(df.head(20))
